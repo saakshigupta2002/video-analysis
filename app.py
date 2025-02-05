@@ -6,6 +6,8 @@ import requests
 import pandas as pd
 import tempfile
 import re
+import asyncio
+import threading
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -29,16 +31,24 @@ st.markdown("""
         .element-container {
             margin-bottom: 0.5rem;
         }
+        /* Target both container and input */
+        .stTextInput {
+            width: 550px;
+        }
+        .stTextInput > div {
+            width: 550px;
+        }
         .stTextInput > div > div > input {
-            max-width: 600px;
+            width: 550px;
+            max-width: 550px;
         }
         iframe {
-            border: none !important;
+            border: none;
             background-color: #000000;
         }
         .stTable td {
-            white-space: normal !important;
-            padding: 0.5rem !important;
+            white-space: normal;
+            padding: 0.5rem;
         }
         .stProgress > div > div > div {
             height: 5px;
@@ -47,8 +57,8 @@ st.markdown("""
             margin-bottom: 1rem;
         }
         h1 {
-            font-size: 1.5rem !important;
-            margin-bottom: 1rem !important;
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
         }
         /* Hide index numbers in table */
         table {
@@ -57,91 +67,155 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+
 # Constants
 API_KEY = os.getenv('GEMINI_API_KEY')
-BUCKET_NAME = "linqia-social-post-data"
-FOLDER_NAME = "tiktok_video_content_analysis"
-S3_BASE_URL = f"https://{BUCKET_NAME}.s3.us-east-1.amazonaws.com/{FOLDER_NAME}"
+S3_BUCKETS = [
+    "linqia-social-post-data.s3.us-east-1.amazonaws.com/tiktok_video_content_analysis",
+    "tiktok-videos.s3.amazonaws.com/videos",
+    # Add more S3 buckets here
+]
+
+def convert_to_embed_url(url):
+    try:
+        if 'embed' in url:
+            return url
+        if '/video/' in url:
+            video_id = url.split('/video/')[1].split('?')[0]
+            return f"https://www.tiktok.com/embed/v2/{video_id}"
+        return url
+    except Exception as e:
+        st.error(f"Error converting URL: {str(e)}")
+        return None
+
+class ProgressManager:
+    def __init__(self, placeholder, progress_bar):
+        self.placeholder = placeholder
+        self.progress_bar = progress_bar
+        self.current_progress = 0
+        self.target_progress = 0
+        self.is_running = True
+        self.current_step = ""
+        
+    def update_target(self, value, step_text):
+        self.target_progress = value
+        self.current_step = step_text
+        
+    def stop(self):
+        self.is_running = False
+        
+    async def animate(self):
+        while self.is_running:
+            if self.current_progress < self.target_progress:
+                self.current_progress = min(self.current_progress + 1, self.target_progress)
+                self.progress_bar.progress(self.current_progress)
+                self.placeholder.text(f"{self.current_step} ({self.current_progress}%)")
+            await asyncio.sleep(0.05)
 
 class TikTokAnalyzer:
     def __init__(self):
         genai.configure(api_key=API_KEY)
         self.model = genai.GenerativeModel('gemini-1.5-flash')
 
-    def extract_video_id(self, tiktok_url):
+    def try_s3_download(self, video_id, progress_mgr):
+        for bucket in S3_BUCKETS:
+            try:
+                url = f"https://{bucket}/{video_id}.mp4"
+                progress_mgr.update_target(20, f"Trying S3 bucket: {bucket}...")
+                
+                response = requests.head(url)
+                if response.status_code == 200:
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                    response = requests.get(url, stream=True)
+                    
+                    with open(temp_file.name, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    
+                    return temp_file.name
+            except Exception:
+                continue
+        return None
+
+    async def analyze_video(self, tiktok_url, progress_mgr):
         try:
-            video_id = tiktok_url.strip('/').split('/')[-1]
-            return video_id
-        except Exception as e:
-            st.error(f"Error extracting video ID: {str(e)}")
-            return None
+            progress_mgr.update_target(10, "Converting URL...")
+            embed_url = convert_to_embed_url(tiktok_url)
+            if not embed_url:
+                return None
 
-    def get_s3_url(self, video_id):
-        return f"{S3_BASE_URL}/{video_id}.mp4"
-
-    def download_video_to_temp(self, s3_url):
-        try:
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-            response = requests.get(s3_url, stream=True)
-            response.raise_for_status()
+            video_id = embed_url.strip('/').split('/')[-1].split('?')[0]
             
-            with open(temp_file.name, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+            # Try S3 first
+            progress_mgr.update_target(20, "Attempting S3 download...")
+            video_path = self.try_s3_download(video_id, progress_mgr)
             
-            return temp_file.name
-        except Exception as e:
-            st.error(f"Error downloading video: {str(e)}")
-            return None
+            if video_path:
+                progress_mgr.update_target(40, "Processing video...")
+                video_file = genai.upload_file(path=video_path)
+                
+                while video_file.state.name == "PROCESSING":
+                    await asyncio.sleep(1)
+                    video_file = genai.get_file(video_file.name)
 
-    async def analyze_video(self, video_path):
-        try:
-            video_file = genai.upload_file(path=video_path)
-            
-            while video_file.state.name == "PROCESSING":
-                time.sleep(2)
-                video_file = genai.get_file(video_file.name)
+                if video_file.state.name == "FAILED":
+                    st.warning("Video processing failed, falling back to URL analysis...")
+                else:
+                    prompt = self.get_analysis_prompt(embed_url)
+                    progress_mgr.update_target(60, "Analyzing video content...")
+                    response = self.model.generate_content(
+                        [video_file, prompt],
+                        generation_config=genai.GenerationConfig(
+                            temperature=0.1,
+                            max_output_tokens=2048
+                        )
+                    )
+                    progress_mgr.update_target(90, "Finalizing analysis...")
+                    return response.text
 
-            if video_file.state.name == "FAILED":
-                raise ValueError(f"Video processing failed: {video_file.state.name}")
-
-            prompt = """Analyze this TikTok video and provide very concise answers (max 10-15 words):
-
-a) Video Summary: Brief description of what happens in the video
-b) Analyze:
-- Content Theme: Main topic/purpose
-- Content Style: How it's filmed
-- Creator Presence: Who appears
-- Key Video Elements: Main objects/actions
-- On-Screen Text/Graphics: Text overlays
-- Spoken Words: Key dialogues
-- Technical Elements: Filming features
-- Auditory Elements: Sounds/music
-- Language: Language used
-- Sentiment/Tone/Vibe: Overall mood
-
-Keep all responses very brief and direct."""
-
+            # Fallback to URL analysis
+            progress_mgr.update_target(50, "Analyzing from URL...")
+            prompt = self.get_analysis_prompt(embed_url)
             response = self.model.generate_content(
-                [video_file, prompt],
-                request_options={"timeout": 600},
+                prompt,
                 generation_config=genai.GenerationConfig(
                     temperature=0.1,
                     max_output_tokens=2048
                 )
             )
-            
+            progress_mgr.update_target(90, "Finalizing analysis...")
             return response.text
+
         except Exception as e:
-            st.error(f"Error analyzing video: {str(e)}")
+            st.error(f"Error in analysis: {str(e)}")
             return None
         finally:
-            if video_path and os.path.exists(video_path):
+            if 'video_path' in locals() and video_path and os.path.exists(video_path):
                 os.remove(video_path)
 
+    def get_analysis_prompt(self, url):
+        return f"""Analyze this TikTok video from URL: {url}
+        
+        Please analyze all visible elements and provide a concise analysis (10-15 words per section):
+
+        a) Video Summary: Brief description of what's shown
+        b) Analysis Categories:
+        - Content Theme: Main topic/purpose
+        - Content Style: How it's filmed/presented
+        - Creator Presence: Who appears
+        - Key Video Elements: Objects/actions shown
+        - On-Screen Text/Graphics: Visible text/overlays
+        - Spoken Words: Key dialogue
+        - Technical Elements: Filming features
+        - Auditory Elements: Sound/music
+        - Language: Languages used
+        - Sentiment/Tone/Vibe: Overall mood
+
+        Keep responses direct and specific to what's visible in the video."""
+
     def clean_text(self, text):
-        """Remove asterisks and clean up text."""
+        """Remove formatting and clean up text."""
         text = text.replace('*', '')
         text = re.sub(r'\[.*?\]', '', text)
         text = ' '.join(text.split())
@@ -161,7 +235,6 @@ Keep all responses very brief and direct."""
         
         df = pd.DataFrame(data)
         lines = text.split('\n')
-        current_section = None
         
         for line in lines:
             line = self.clean_text(line)
@@ -179,35 +252,29 @@ Keep all responses very brief and direct."""
         
         return df
 
-def main():
+async def main_async():
     st.title("Video Analysis")
     
-    # Initialize analyzer
     analyzer = TikTokAnalyzer()
 
-    # TikTok URL input with contained width
-    col1, col2 = st.columns([2, 2])
-    with col1:
-        tiktok_url = st.text_input(
-            "Enter TikTok embed URL", 
-            placeholder="https://www.tiktok.com/embed/v2/..."
-        )
+    tiktok_url = st.text_input(
+        "Enter TikTok URL", 
+        placeholder="https://www.tiktok.com/@username/video/... or embed URL"
+    )
 
     if tiktok_url:
         try:
-            video_id = analyzer.extract_video_id(tiktok_url)
-            if not video_id:
+            embed_url = convert_to_embed_url(tiktok_url)
+            if not embed_url:
+                st.error("Invalid TikTok URL format")
                 return
 
-            s3_url = analyzer.get_s3_url(video_id)
-            
-            # Create two columns for layout
             col1, col2 = st.columns([2, 3])
             
             with col1:
                 embed_html = f'''
                     <div style="padding:0;margin:0;background:#000;">
-                        <iframe src="{tiktok_url}" 
+                        <iframe src="{embed_url}" 
                                 width="100%" 
                                 height="600" 
                                 frameborder="0" 
@@ -220,52 +287,43 @@ def main():
                 st.components.v1.html(embed_html, height=600)
 
             with col2:
-                # Create a progress bar
                 progress_placeholder = st.empty()
                 progress_bar = st.progress(0)
                 
-                # Analysis steps with progress updates
-                progress_placeholder.text("Downloading video...")
-                progress_bar.progress(20)
+                progress_mgr = ProgressManager(progress_placeholder, progress_bar)
+                animation_task = asyncio.create_task(progress_mgr.animate())
                 
-                temp_video_path = analyzer.download_video_to_temp(s3_url)
-                if temp_video_path:
-                    progress_placeholder.text("Processing video...")
-                    progress_bar.progress(40)
+                analysis_result = await analyzer.analyze_video(tiktok_url, progress_mgr)
+                
+                if analysis_result:
+                    progress_mgr.update_target(100, "Analysis complete!")
+                    await asyncio.sleep(0.5)
+                    progress_mgr.stop()
+                    await animation_task
                     
-                    import asyncio
-                    progress_placeholder.text("Analyzing content...")
-                    progress_bar.progress(60)
+                    progress_placeholder.empty()
+                    progress_bar.empty()
                     
-                    analysis_result = asyncio.run(analyzer.analyze_video(temp_video_path))
-                    
-                    if analysis_result:
-                        progress_placeholder.text("Generating results...")
-                        progress_bar.progress(80)
-                        
-                        df = analyzer.create_analysis_table(analysis_result)
-                        if not df.empty:
-                            progress_placeholder.text("Analysis complete!")
-                            progress_bar.progress(100)
-                            time.sleep(0.5)
-                            progress_placeholder.empty()
-                            progress_bar.empty()
-                            
-                            # Display table without index
-                            st.table(df.set_index('Category').style.set_properties(**{
-                                'white-space': 'normal',
-                                'text-align': 'left',
-                                'padding': '0.5rem'
-                            }))
+                    df = analyzer.create_analysis_table(analysis_result)
+                    if not df.empty:
+                        st.table(df.set_index('Category').style.set_properties(**{
+                            'white-space': 'normal',
+                            'text-align': 'left',
+                            'padding': '0.5rem'
+                        }))
                     else:
-                        progress_placeholder.error("Analysis failed.")
-                        progress_bar.empty()
+                        st.error("Failed to parse analysis results.")
                 else:
-                    progress_placeholder.error("Failed to download video.")
+                    progress_mgr.stop()
+                    await animation_task
+                    progress_placeholder.error("Analysis failed.")
                     progress_bar.empty()
                     
         except Exception as e:
             st.error(f"An error occurred: {str(e)}")
+
+def main():
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
