@@ -547,7 +547,6 @@ class PromptBuilder:
             prompt = """
             Analyze this TikTok video and provide:
             a) Brief video summary
-            b) Answer these questions:
 
             i) Content Theme [Content Theme refers to the primary subject matter, topic, or field that the video primarily focuses on.
             This represents the core message or information being conveyed, regardless of presentation style or sound.
