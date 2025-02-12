@@ -7,3 +7,6 @@ asyncio
 boto3
 openpyxl
 aiohttp
+gspread
+google-auth
+google-auth-oauthlib
